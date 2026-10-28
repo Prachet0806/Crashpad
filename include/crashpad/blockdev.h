@@ -28,7 +28,8 @@ typedef enum {
     CP_E_RANGE = -2,   /* misaligned or out-of-bounds request */
     CP_E_CORRUPT = -3, /* checksum / format violation */
     CP_E_NOMEM = -4,
-    CP_E_CRASHED = -5  /* simulated device has "lost power" */
+    CP_E_CRASHED = -5, /* simulated device has "lost power" */
+    CP_E_BUSY = -6     /* operation cannot proceed while resources are pinned */
 } cp_status;
 
 typedef struct cp_blockdev cp_blockdev;

@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { EXPLORER_WRITES = 8 };
+enum { EXPLORER_KEYS = 12, EXPLORER_WRITES = 16 };
 enum { BROKEN_COMMIT = 2 };
 
 static void put32le(uint8_t *p, uint32_t value) {
@@ -46,25 +46,51 @@ static int broken_wal_demo(void) {
     return caught;
 }
 
-static int check_state(cp_store *store, size_t acknowledged) {
-    for (uint64_t key = 0; key < EXPLORER_WRITES; ++key) {
+static int check_state(cp_store *store, size_t point,
+                       const uint64_t *put_ends,
+                       const uint64_t *put_keys,
+                       const uint64_t *put_values) {
+    uint64_t required[EXPLORER_KEYS] = {0};
+    unsigned char required_present[EXPLORER_KEYS] = {0};
+    uint64_t maximum[EXPLORER_KEYS] = {0};
+    for (size_t i = 0; i < EXPLORER_WRITES; ++i) {
+        uint64_t key = put_keys[i];
+        if (!required_present[key] || put_values[i] > maximum[key]) maximum[key] = put_values[i];
+        if (put_ends[i] <= point) {
+            required[key] = put_values[i];
+            required_present[key] = 1;
+        }
+    }
+    for (uint64_t key = 0; key < EXPLORER_KEYS; ++key) {
         uint64_t value = 0;
         cp_status status = cp_store_get(store, key, &value);
         if (status == CP_OK) {
-            if (value != key * 17 + 5) return 0;
-        } else if (status != CP_E_RANGE || key < acknowledged) {
+            if (value > maximum[key] ||
+                (required_present[key] && value < required[key])) return 0;
+        } else if (status != CP_E_RANGE || required_present[key]) {
             return 0;
         }
     }
     return 1;
 }
 
-static void record_failure(size_t *violations, size_t point,
-                           cp_unsynced_policy policy, unsigned seed,
-                           int tear, size_t acknowledged) {
+static void record_failure(const cp_sim_dev *sim, size_t *violations,
+                           size_t point, cp_unsynced_policy policy,
+                           unsigned seed, int tear) {
     if (*violations == 0)
-        printf("minimal failing schedule: point=%zu policy=%d seed=%u tear=%d acknowledged=%zu\n",
-               point, (int)policy, seed, tear, acknowledged);
+    {
+        printf("minimal failing schedule: point=%zu policy=%d seed=%u tear=%d\ntrace:\n",
+               point, (int)policy, seed, tear);
+        for (size_t i = 0; i < point; ++i) {
+            const cp_trace_op *op = cp_sim_trace_at(sim, i);
+            if (!op) continue;
+            if (op->kind == CP_OP_WRITE)
+                printf("  %zu WRITE off=%llu len=%u\n", i,
+                       (unsigned long long)op->off, op->len);
+            else
+                printf("  %zu SYNC\n", i);
+        }
+    }
     ++*violations;
 }
 
@@ -73,11 +99,22 @@ int main(int argc, char **argv) {
     cp_sim_dev *sim = NULL;
     cp_blockdev *dev = NULL;
     cp_store *store = NULL;
+    uint64_t put_ends[EXPLORER_WRITES], put_keys[EXPLORER_WRITES], put_values[EXPLORER_WRITES];
     if (cp_sim_dev_create(16u * 1024u * 1024u, &sim, &dev) != CP_OK ||
         cp_store_open(dev, 8, &store) != CP_OK) return 1;
-    for (uint64_t key = 0; key < EXPLORER_WRITES; ++key) {
-        if (cp_store_put(store, key, key * 17 + 5) != CP_OK) return 1;
+    for (size_t i = 0; i < EXPLORER_WRITES; ++i) {
+        uint64_t key, value;
+        if (i < 8) { key = i; value = key * 17 + 5; }
+        else if (i < 12) { key = (i - 8) % 2; value = 10000 + i; }
+        else { key = i - 4; value = 20000 + i; }
+        if (cp_store_put(store, key, value) != CP_OK) return 1;
+        put_keys[i] = key;
+        put_values[i] = value;
+        put_ends[i] = cp_sim_trace_len(sim);
+        if (i == 7 && cp_store_checkpoint(store) != CP_OK) return 1;
     }
+    if (cp_store_checkpoint(store) != CP_OK) return 1;
+    /* Exercise replacement of a valid checkpoint after later WAL updates. */
     if (cp_store_checkpoint(store) != CP_OK) return 1;
 
     size_t points = cp_sim_trace_len(sim), cases = 0, violations = 0;
@@ -85,12 +122,6 @@ int main(int argc, char **argv) {
         CP_UNSYNCED_DROP_ALL, CP_UNSYNCED_KEEP_ALL, CP_UNSYNCED_SUBSET
     };
     for (size_t p = 0; p <= points; ++p) {
-        size_t acknowledged = 0;
-        for (size_t i = 0; i < p; ++i) {
-            const cp_trace_op *op = cp_sim_trace_at(sim, i);
-            if (op && op->kind == CP_OP_SYNC && acknowledged < EXPLORER_WRITES)
-                acknowledged++;
-        }
         for (size_t q = 0; q < sizeof(policies) / sizeof(policies[0]); ++q) {
             unsigned seeds = policies[q] == CP_UNSYNCED_SUBSET ? 4u : 1u;
             for (unsigned seed = 1; seed <= seeds; ++seed) {
@@ -102,26 +133,26 @@ int main(int argc, char **argv) {
                 cp_blockdev *image = NULL;
                 cp_store *recovered = NULL;
                 if (cp_sim_crash_image(sim, &spec, &image) != CP_OK) {
-                    record_failure(&violations, p, policies[q], seed, tear, acknowledged);
+                    record_failure(sim, &violations, p, policies[q], seed, tear);
                     continue;
                 }
                 cp_status status = cp_store_open(image, 8, &recovered);
                 if (status != CP_OK) {
-                    record_failure(&violations, p, policies[q], seed, tear, acknowledged);
+                    record_failure(sim, &violations, p, policies[q], seed, tear);
                 } else {
                     cases++;
-                    if (!check_state(recovered, acknowledged) ||
+                    if (!check_state(recovered, p, put_ends, put_keys, put_values) ||
                         cp_store_recover(recovered) != CP_OK ||
-                        !check_state(recovered, acknowledged))
-                        record_failure(&violations, p, policies[q], seed, tear, acknowledged);
+                        !check_state(recovered, p, put_ends, put_keys, put_values))
+                        record_failure(sim, &violations, p, policies[q], seed, tear);
                     cp_store_close(recovered);
                 }
                 cp_dev_close(image);
             }
         }
     }
-    printf("crash points=%zu scenarios=%zu violations=%zu seeds=1..4\n",
-           points, cases, violations);
+    printf("crash points=%zu scenarios=%zu violations=%zu workload_puts=%u repeated_updates=yes checkpoints=3 seeds=1..4\n",
+           points, cases, violations, (unsigned)EXPLORER_WRITES);
     int broken_caught = !broken_demo || broken_wal_demo();
     cp_store_close(store);
     cp_dev_close(dev);

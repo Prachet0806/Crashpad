@@ -15,6 +15,8 @@ typedef int (*cp_scan_fn)(uint64_t key, uint64_t value, void *context);
  * after closing the store. `buffer_pages` sets its checkpoint buffer pool. */
 cp_status cp_store_open(cp_blockdev *dev, size_t buffer_pages, cp_store **out);
 void cp_store_close(cp_store *store);
+/* An ambiguous WAL write/sync error puts the store into needs-recovery state.
+ * Puts then return CP_E_IO until cp_store_recover succeeds. */
 cp_status cp_store_put(cp_store *store, uint64_t key, uint64_t value);
 cp_status cp_store_get(cp_store *store, uint64_t key, uint64_t *value_out);
 cp_status cp_store_scan(cp_store *store, uint64_t first, uint64_t last,
@@ -33,6 +35,8 @@ cp_status cp_coordinator_open(const char *directory, size_t nshards,
 void cp_coordinator_close(cp_coordinator *coordinator);
 cp_status cp_coordinator_put(cp_coordinator *, uint64_t key, uint64_t value);
 cp_status cp_coordinator_get(cp_coordinator *, uint64_t key, uint64_t *value);
+/* Scans shards sequentially without a global snapshot. The callback runs while
+ * the current shard and store locks are held; it must not re-enter them. */
 cp_status cp_coordinator_scan(cp_coordinator *, uint64_t first, uint64_t last,
                               cp_scan_fn callback, void *context);
 cp_status cp_coordinator_join(cp_coordinator *, const cp_kv *left, size_t nleft,
