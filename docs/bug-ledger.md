@@ -1,0 +1,11 @@
+# CrashPad bug ledger
+
+Failures below were reproduced during the initial implementation and fixed before the current regression run. The listed results are local to the recorded source revision; hosted CI has not been run.
+
+| ID | Reproducer | Root cause | Fix | Regression |
+|---|---|---|---|---|
+| B1 | First B+-tree `put` after opening an empty store caused a Windows access violation reading address zero. | `node_new(1)` allocated a leaf but left `leaf` equal to zero, so insertion treated it as an internal node and followed a null child. | Initialize the node's leaf flag at allocation. | `test_tree_wal` inserts a permuted 1,000-key workload and reads every key back. |
+| B2 | A fresh store's first committed transaction disappeared during recovery. | Empty-log replay initialized the next transaction to 1 although the first WAL slot is transaction 0. | Replay now starts with expected transaction 0 and sets the next ID to the number of contiguous valid transactions found. | Reopening after the first transaction and after 1,000 transactions is covered by `test_tree_wal`. |
+| B3 | Crash exploration reported missing acknowledged data at earlier crash points. | Crash-image construction used the simulator's final durable image as the base, leaking writes synced after the selected historical crash point. | Reconstruct each image from the initial zeroed device by replaying only trace operations before the selected crash point. | `crashpad-explore` sweeps every point and checks acknowledged writes plus valid unacknowledged outcomes. |
+| B4 | The first 1,000-key lookup test reported key 1 as 929 instead of 689. | The test oracle applied the forward key permutation to a lookup key instead of recording the value associated with each inserted key. | Record expected values by generated key before insertion. | Same deterministic property test now compares against the correct reference array. |
+| B5 | Reopening concurrently written shard files failed on Windows, with corrupted WAL transaction fields and page values. | The Windows CRT opened file devices in text mode, translating `0x0A` bytes during `_write` and shifting binary records. | Add `O_BINARY` to the Windows file-open flags. | Coordinator storage regression writes concurrently to shards, closes, reopens, and checks persisted keys; full CTest passes. |

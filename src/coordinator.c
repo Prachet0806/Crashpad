@@ -1,0 +1,45 @@
+#define _POSIX_C_SOURCE 200809L
+#include "crashpad/store.h"
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define cp_mkdir(path) _mkdir(path)
+#define cp_access(path) _access((path),0)
+#else
+#include <unistd.h>
+#define cp_mkdir(path) mkdir((path),0755)
+#define cp_access(path) access((path),F_OK)
+#endif
+typedef struct {cp_store*store;cp_blockdev*dev;pthread_mutex_t mu;char*path;int mu_init;} shard;
+struct cp_coordinator {size_t n;shard*s;};
+static uint64_t hash_key(uint64_t x){x^=x>>30;x*=UINT64_C(0xbf58476d1ce4e5b9);x^=x>>27;x*=UINT64_C(0x94d049bb133111eb);return x^(x>>31);}
+cp_status cp_coordinator_open(const char*dir,size_t n,size_t bp,cp_coordinator**out){if(!dir||!n||!out)return CP_E_RANGE;if(cp_mkdir(dir)&&errno!=EEXIST)return CP_E_IO;cp_coordinator*c=calloc(1,sizeof(*c));if(!c)return CP_E_NOMEM;c->s=calloc(n,sizeof(*c->s));if(!c->s){free(c);return CP_E_NOMEM;}c->n=n;for(size_t i=0;i<n;i++){if(pthread_mutex_init(&c->s[i].mu,NULL)){cp_coordinator_close(c);return CP_E_IO;}c->s[i].mu_init=1;size_t z=strlen(dir)+32;c->s[i].path=malloc(z);if(!c->s[i].path){cp_coordinator_close(c);return CP_E_NOMEM;}snprintf(c->s[i].path,z,"%s/shard-%zu.db",dir,i);int missing=cp_access(c->s[i].path)!=0&&errno==ENOENT;cp_status r=cp_file_dev_open(c->s[i].path,0,&c->s[i].dev);if(r!=CP_OK&&missing)r=cp_file_dev_open(c->s[i].path,1,&c->s[i].dev);if(r==CP_OK)r=cp_store_open(c->s[i].dev,bp,&c->s[i].store);if(r!=CP_OK){cp_coordinator_close(c);return r;}}*out=c;return CP_OK;}
+void cp_coordinator_close(cp_coordinator*c){if(!c)return;for(size_t i=0;i<c->n;i++){if(c->s[i].store)cp_store_close(c->s[i].store);if(c->s[i].dev)cp_dev_close(c->s[i].dev);if(c->s[i].mu_init)pthread_mutex_destroy(&c->s[i].mu);free(c->s[i].path);}free(c->s);free(c);}
+size_t cp_coordinator_shard_for(const cp_coordinator*c,uint64_t k){return c?hash_key(k)%c->n:0;}
+size_t cp_coordinator_shard_count(const cp_coordinator*c){return c?c->n:0;}
+cp_status cp_coordinator_put(cp_coordinator*c,uint64_t k,uint64_t v){if(!c)return CP_E_RANGE;shard*s=&c->s[cp_coordinator_shard_for(c,k)];pthread_mutex_lock(&s->mu);cp_status r=cp_store_put(s->store,k,v);pthread_mutex_unlock(&s->mu);return r;}
+cp_status cp_coordinator_get(cp_coordinator*c,uint64_t k,uint64_t*v){if(!c)return CP_E_RANGE;shard*s=&c->s[cp_coordinator_shard_for(c,k)];pthread_mutex_lock(&s->mu);cp_status r=cp_store_get(s->store,k,v);pthread_mutex_unlock(&s->mu);return r;}
+typedef struct {cp_scan_fn cb;void*ctx;} scan_ctx;
+static int scan_proxy(uint64_t k,uint64_t v,void*p){scan_ctx*c=p;return c->cb(k,v,c->ctx);}
+cp_status cp_coordinator_scan(cp_coordinator*c,uint64_t a,uint64_t b,cp_scan_fn cb,void*ctx){if(!c||!cb)return CP_E_RANGE;if(a>b)return CP_OK;scan_ctx x={cb,ctx};for(size_t i=0;i<c->n;i++){pthread_mutex_lock(&c->s[i].mu);cp_status r=cp_store_scan(c->s[i].store,a,b,scan_proxy,&x);pthread_mutex_unlock(&c->s[i].mu);if(r!=CP_OK)return r;}return CP_OK;}
+typedef struct {uint64_t key;size_t nl,nr;int used;} frequency;
+typedef struct {cp_kv*data;size_t n,cap;} kv_vec;
+typedef struct {cp_join_row*data;size_t n,cap;} row_vec;
+typedef struct {uint64_t key;size_t row;int used;} join_ent;
+typedef struct {const cp_kv*l,*r;size_t nl,nr;row_vec result;cp_status status;} join_job;
+static int power_capacity(size_t n,size_t*out){size_t p=1;while(p<n){if(p>SIZE_MAX/2)return 0;p*=2;}*out=p;return 1;}
+static frequency*freq_find(frequency*t,size_t cap,uint64_t key,int create){size_t j=(size_t)hash_key(key)&(cap-1);while(t[j].used){if(t[j].key==key)return &t[j];j=(j+1)&(cap-1);}if(!create)return NULL;t[j].used=1;t[j].key=key;return &t[j];}
+static int vec_push(kv_vec*v,cp_kv x){if(v->n==v->cap){size_t z=v->cap?v->cap*2:64;if(z<v->cap||z>SIZE_MAX/sizeof(cp_kv))return 0;cp_kv*p=realloc(v->data,z*sizeof(*p));if(!p)return 0;v->data=p;v->cap=z;}v->data[v->n++]=x;return 1;}
+static int row_push(row_vec*v,cp_join_row x){if(v->n==v->cap){size_t z=v->cap?v->cap*2:64;if(z<v->cap||z>SIZE_MAX/sizeof(cp_join_row))return 0;cp_join_row*p=realloc(v->data,z*sizeof(*p));if(!p)return 0;v->data=p;v->cap=z;}v->data[v->n++]=x;return 1;}
+static void*join_worker(void*arg){join_job*j=arg;j->status=CP_OK;if(j->nr>(SIZE_MAX-1)/2){j->status=CP_E_NOMEM;return NULL;}size_t cap;if(!power_capacity(j->nr*2+1,&cap)){j->status=CP_E_NOMEM;return NULL;}join_ent*t=calloc(cap,sizeof(*t));if(!t){j->status=CP_E_NOMEM;return NULL;}for(size_t i=0;i<j->nr;i++){size_t p=(size_t)hash_key(j->r[i].key)&(cap-1);while(t[p].used)p=(p+1)&(cap-1);t[p]=(join_ent){j->r[i].key,i,1};}for(size_t i=0;i<j->nl;i++){size_t p=(size_t)hash_key(j->l[i].key)&(cap-1);while(t[p].used){if(t[p].key==j->l[i].key&&!row_push(&j->result,(cp_join_row){j->l[i].key,j->l[i].value,j->r[t[p].row].value})){j->status=CP_E_NOMEM;free(t);return NULL;}p=(p+1)&(cap-1);}}free(t);return NULL;}
+static cp_status distribute(cp_coordinator*c,const cp_kv*l,size_t nl,const cp_kv*r,size_t nr,int mitigate,kv_vec*lv,kv_vec*rv,frequency**freq_out,size_t*freq_cap){if(nl>SIZE_MAX-nr||nl+nr>SIZE_MAX/2-1)return CP_E_NOMEM;size_t total=nl+nr,cap;if(!power_capacity(total*2+1,&cap)){return CP_E_NOMEM;}frequency*f=calloc(cap,sizeof(*f));if(!f)return CP_E_NOMEM;for(size_t i=0;i<nl;i++){frequency*x=freq_find(f,cap,l[i].key,1);if(x->nl==SIZE_MAX){free(f);return CP_E_NOMEM;}x->nl++;}for(size_t i=0;i<nr;i++){frequency*x=freq_find(f,cap,r[i].key,1);if(x->nr==SIZE_MAX){free(f);return CP_E_NOMEM;}x->nr++;}for(size_t i=0;i<nl;i++){frequency*x=freq_find(f,cap,l[i].key,0);size_t target=(mitigate&&x&&(x->nl>=8||x->nr>=8))?i%c->n:cp_coordinator_shard_for(c,l[i].key);if(!vec_push(&lv[target],l[i])){free(f);return CP_E_NOMEM;}}for(size_t i=0;i<nr;i++){frequency*x=freq_find(f,cap,r[i].key,0);if(mitigate&&x&&(x->nl>=8||x->nr>=8)){for(size_t target=0;target<c->n;target++)if(!vec_push(&rv[target],r[i])){free(f);return CP_E_NOMEM;}}else if(!vec_push(&rv[cp_coordinator_shard_for(c,r[i].key)],r[i])){free(f);return CP_E_NOMEM;}}*freq_out=f;*freq_cap=cap;return CP_OK;}
+cp_status cp_coordinator_join_ex(cp_coordinator*c,const cp_kv*l,size_t nl,const cp_kv*r,size_t nr,int mitigate,cp_join_row**out,size_t*count){if(!c||(!l&&nl)||(!r&&nr)||!out||!count)return CP_E_RANGE;*out=NULL;*count=0;if(nl>SIZE_MAX/sizeof(kv_vec)||nr>SIZE_MAX/sizeof(kv_vec))return CP_E_NOMEM;kv_vec*lv=calloc(c->n,sizeof(*lv)),*rv=calloc(c->n,sizeof(*rv));join_job*jobs=calloc(c->n,sizeof(*jobs));pthread_t*threads=calloc(c->n,sizeof(*threads));unsigned char*started=calloc(c->n,1);if(!lv||!rv||!jobs||!threads||!started){free(lv);free(rv);free(jobs);free(threads);free(started);return CP_E_NOMEM;}frequency*f=NULL;size_t fcap=0;cp_status status=distribute(c,l,nl,r,nr,mitigate,lv,rv,&f,&fcap);if(status!=CP_OK)goto done;free(f);(void)fcap;for(size_t i=0;i<c->n;i++){jobs[i]=(join_job){lv[i].data,rv[i].data,lv[i].n,rv[i].n,{0},CP_OK};if(pthread_create(&threads[i],NULL,join_worker,&jobs[i])==0)started[i]=1;else (void)join_worker(&jobs[i]);}int join_failed=0;for(size_t i=0;i<c->n;i++)if(started[i]&&pthread_join(threads[i],NULL)!=0)join_failed=1;if(join_failed){status=CP_E_IO;goto done;}size_t total=0;for(size_t i=0;i<c->n;i++){if(jobs[i].status!=CP_OK){status=jobs[i].status;goto done;}if(jobs[i].result.n>SIZE_MAX-total){status=CP_E_NOMEM;goto done;}total+=jobs[i].result.n;}if(total>SIZE_MAX/sizeof(cp_join_row)){status=CP_E_NOMEM;goto done;}cp_join_row*rows=total?malloc(total*sizeof(*rows)):NULL;if(total&&!rows){status=CP_E_NOMEM;goto done;}size_t offset=0;for(size_t i=0;i<c->n;i++){if(jobs[i].result.n)memcpy(rows+offset,jobs[i].result.data,jobs[i].result.n*sizeof(*rows));offset+=jobs[i].result.n;}*out=rows;*count=total;status=CP_OK;
+done:for(size_t i=0;i<c->n;i++){free(lv?lv[i].data:NULL);free(rv?rv[i].data:NULL);free(jobs?jobs[i].result.data:NULL);}free(lv);free(rv);free(jobs);free(threads);free(started);return status;}
+cp_status cp_coordinator_join(cp_coordinator*c,const cp_kv*l,size_t nl,const cp_kv*r,size_t nr,cp_join_row**out,size_t*count){return cp_coordinator_join_ex(c,l,nl,r,nr,1,out,count);}
+void cp_coordinator_explain(cp_coordinator*c,const cp_kv*l,size_t nl,const cp_kv*r,size_t nr,FILE*out){cp_coordinator_explain_ex(c,l,nl,r,nr,1,out);}
+void cp_coordinator_explain_ex(cp_coordinator*c,const cp_kv*l,size_t nl,const cp_kv*r,size_t nr,int mitigate,FILE*out){if(!c||!out||(!l&&nl)||(!r&&nr))return;kv_vec*lv=calloc(c->n,sizeof(*lv)),*rv=calloc(c->n,sizeof(*rv));if(!lv||!rv){free(lv);free(rv);fprintf(out,"explain unavailable: allocation failed\n");return;}frequency*f=NULL;size_t cap=0;cp_status s=distribute(c,l,nl,r,nr,mitigate,lv,rv,&f,&cap);if(s!=CP_OK){fprintf(out,"explain unavailable: status=%d\n",s);}else{size_t hot=0;for(size_t i=0;i<cap;i++)if(f[i].used&&(f[i].nl>=8||f[i].nr>=8))hot++;fprintf(out,"shards=%zu left=%zu right=%zu hot_keys=%zu\n",c->n,nl,nr,hot);for(size_t i=0;i<c->n;i++)fprintf(out,"shard %zu: left_rows=%zu right_rows=%zu rows_moved=%zu\n",i,lv[i].n,rv[i].n,lv[i].n+rv[i].n);}free(f);for(size_t i=0;i<c->n;i++){free(lv[i].data);free(rv[i].data);}free(lv);free(rv);}

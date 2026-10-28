@@ -1,0 +1,32 @@
+# CMake build trees and generated metadata
+/build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+Testing/
+
+# Compiled Windows binaries and libraries
+*.exe
+*.dll
+*.lib
+*.a
+*.obj
+*.o
+
+# Runtime stores, test fixtures, and generated benchmark relations
+/crashpad-data/
+/test-data/
+/test-shell-data/
+/shell-check-data/
+/bench-data/
+/coordinator-test-data/
+/coordinator-test-*/
+/left-rel.txt
+/right-rel.txt
+
+# IDE and editor files
+.vs/
+*.user
+*.suo
